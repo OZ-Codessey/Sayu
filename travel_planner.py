@@ -1,6 +1,8 @@
 import argparse
+import os                     # [Commit 4 추가] 환경변수 조회를 위한 표준 os 모듈
 import sys
 from datetime import datetime
+from dotenv import load_dotenv  # [Commit 4 추가] .env 파일 로드 라이브러리
 
 # ==============================================================================
 # [Design System] 자연과 건축의 여정 (ANSI 색채 & 타이포그래피)
@@ -35,9 +37,7 @@ class Style:
 # ==============================================================================
 
 def get_seasonal_theme(date_str: str) -> tuple[str, str]:
-    """
-    [Commit 3] 입력된 날짜(월)를 분석하여 사계절 공간 테마를 반환합니다.
-    """
+    """[Commit 3] 입력된 날짜(월)를 분석하여 사계절 공간 테마를 반환합니다."""
     try:
         month = datetime.strptime(date_str, "%Y-%m-%d").month
     except ValueError:
@@ -54,9 +54,7 @@ def get_seasonal_theme(date_str: str) -> tuple[str, str]:
 
 
 def print_banner(date_str: str):
-    """
-    [Commit 3] 상단 브랜딩 배너를 출력합니다.
-    """
+    """[Commit 3] 상단 브랜딩 배너를 출력합니다."""
     theme_text, theme_color = get_seasonal_theme(date_str)
     header_title = (
         f"{Style.BOLD}{Style.WHITE}[ {Style.FOREST_GRN}사유(思惟){Style.WHITE} 여행 큐레이션 ]{Style.RESET}"
@@ -70,9 +68,7 @@ def print_banner(date_str: str):
 
 
 def parse_arguments() -> argparse.Namespace:
-    """
-    [Commit 3] CLI 명령줄 인자를 파싱합니다. (--date 필수 옵션)
-    """
+    """[Commit 3] CLI 명령줄 인자를 파싱합니다. (--date 필수 옵션)"""
     parser = argparse.ArgumentParser(
         description="자연과 건축 기반 사유(思惟) 여행 큐레이션 CLI 도구",
         usage="python travel_planner.py --date \"YYYY-MM-DD\""
@@ -86,13 +82,8 @@ def parse_arguments() -> argparse.Namespace:
     return parser.parse_args()
 
 
-# ==============================================================================
-# [오류 방어 1-1] 잘못된 날짜 형식 및 미존재 날짜 방어 (예: 2026-13-45 등)
-# ==============================================================================
 def validate_date(date_str: str) -> str:
-    """
-    [Commit 3 / 오류 방어 1-1] 날짜 유효성 검증 및 포맷 오류 방어
-    """
+    """[Commit 3 / 오류 방어 1-1] 잘못된 날짜 형식 및 미존재 날짜 방어"""
     date_format = "%Y-%m-%d"
     try:
         valid_date = datetime.strptime(date_str, date_format)
@@ -104,19 +95,52 @@ def validate_date(date_str: str) -> str:
         sys.exit(1)
 
 
+# ==============================================================================
+# [Commit 4 / 오류 방어 1-2] API 키 환경변수 보안 검증 및 누락 방어
+# ==============================================================================
+def check_api_keys() -> tuple[str, str]:
+    """
+    [Commit 4 / 오류 방어 1-2] Gemini 및 Kakao API 키 존재 여부를 검증합니다.
+    - 누락 시 즉시 실행 종료(sys.exit(1)) 및 설정 가이드 출력
+    """
+    load_dotenv()
+    
+    gemini_key = os.getenv("GEMINI_API_KEY")
+    kakao_key = os.getenv("KAKAO_REST_API_KEY")
+    
+    missing_keys = []
+    if not gemini_key:
+        missing_keys.append("GEMINI_API_KEY")
+    if not kakao_key:
+        missing_keys.append("KAKAO_REST_API_KEY")
+        
+    if missing_keys:
+        print(f"\n{Style.BG_RED} ❌ AUTH ERROR {Style.RESET} {Style.BOLD}{Style.ORANGE}필수 API 키가 환경변수에 설정되지 않았습니다.{Style.RESET}")
+        print(f"   {Style.CONCRETE}누락된 키 : {', '.join(missing_keys)}{Style.RESET}")
+        print(f"   {Style.YELLOW}💡 설정 방법: 프로젝트 루트의 .env 파일에 아래 내용을 작성해 주세요.{Style.RESET}")
+        print(f"      {Style.DIM}GEMINI_API_KEY=\"your_gemini_api_key\"{Style.RESET}")
+        print(f"      {Style.DIM}KAKAO_REST_API_KEY=\"your_kakao_rest_api_key\"{Style.RESET}\n")
+        sys.exit(1)
+        
+    return gemini_key, kakao_key
+
+
 def main():
-    # 1. 인자 파싱
+    # 1. 인자 파싱 [Commit 3]
     args = parse_arguments()
     
-    # 2. 날짜 유효성 검증 [오류 방어 1-1]
+    # 2. 날짜 유효성 검증 [Commit 3 / 오류 방어 1-1]
     travel_date = validate_date(args.date)
     
-    # 3. 배너 출력
+    # 3. 배너 출력 [Commit 3]
     print_banner(travel_date)
     
-    # 4. Commit 3 초기화 완료 안내
-    print(f"{Style.SUCCESS_GRN}✔ [CLI 초기화] 파라미터 및 공간 테마 검증이 완료되었습니다.{Style.RESET}")
-    print(f"  {Style.CONCRETE}파이프라인 준비 상태: 정상 (API 키 보안 검증 레이어로 진입 준비 완료){Style.RESET}\n")
+    # 4. API 키 보안 검증 [Commit 4 / 오류 방어 1-2 추가]
+    gemini_key, kakao_key = check_api_keys()
+    
+    # 5. Commit 4 초기화 완료 안내
+    print(f"{Style.SUCCESS_GRN}✔ [보안 검증 완료] Gemini 및 Kakao API 키가 안전하게 로드되었습니다.{Style.RESET}")
+    print(f"  {Style.CONCRETE}파이프라인 준비 상태: 정상 (LLM 사유 큐레이션 단계로 진입 준비 완료){Style.RESET}\n")
 
 
 if __name__ == "__main__":

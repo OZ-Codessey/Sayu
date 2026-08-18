@@ -13,6 +13,9 @@ from google import genai
 from google.genai import types
 from google.genai.errors import APIError  # [Commit 6] LLM 통신/서버 에러 방어용
 
+# [Commit 7] 카카오 로컬 REST API 통신용 라이브러리 (pip install requests)
+import requests
+
 
 # ==============================================================================
 # [Design System] 자연과 건축의 여정 (ANSI 색채 & 타이포그래피)
@@ -243,7 +246,7 @@ def call_gemini_multi_city_recommendation(date_str: str, api_key: str, is_retry:
 
     prompt = build_curation_prompt(date_str, is_retry=is_retry)
     response = client.models.generate_content(
-        model="gemini-3.6-flash",  # 최신 모델 사용
+        model="gemini-3.5-flash",
         contents=prompt,
         config=config
     )
@@ -286,8 +289,6 @@ def get_curated_recommendations_with_retry(date_str: str, api_key: str, errors: 
     # 1차 시도 (API 통신 및 파싱)
     try:
         raw_text = call_gemini_multi_city_recommendation(date_str, api_key, is_retry=False)
-
-
     except Exception as api_err:
         print(f"\n{Style.BG_RED} ❌ NETWORK / SERVER ERROR {Style.RESET} {Style.BOLD}{Style.ORANGE}Gemini API 서버 통신 실패 (일시적 과부하 또는 네트워크 장애){Style.RESET}")
         print(f"   {Style.CONCRETE}에러 내용 : {api_err}{Style.RESET}")
@@ -334,6 +335,77 @@ def get_curated_recommendations_with_retry(date_str: str, api_key: str, errors: 
 
 
 # ==============================================================================
+# [Commit 7] 카카오 로컬 REST API 기반 다중 도시 맛집 검색 파이프라인
+# ==============================================================================
+def fetch_kakao_restaurants_by_city(city_name: str, kakao_api_key: str, size: int = 5) -> list[dict]:
+    """
+    [Commit 7 / 과제 공통 조건] 단일 도시에 대한 카카오 로컬 키워드 검색 API 호출
+    - 검색 키워드: '{city_name} 맛집'
+    - 카테고리 필터: 음식점(FD6)
+    - 필수 추출 필드: place_name, address, road_address, lat, lng(x/y), url, phone
+    """
+    url = "https://dapi.kakao.com/v2/local/search/keyword.json"
+    headers = {
+        "Authorization": f"KakaoAK {kakao_api_key}"
+    }
+    params = {
+        "query": f"{city_name} 맛집",
+        "category_group_code": "FD6",  # 음식점(FD6) 고유 카테고리 필터
+        "size": size,                  # 도시별 5곳 확보
+        "sort": "accuracy"             # 정확도순 정렬
+    }
+
+    response = requests.get(url, headers=headers, params=params, timeout=5)
+    response.raise_for_status()
+    data = response.json()
+
+    restaurants = []
+    for doc in data.get("documents", []):
+        # 🌟 [과제 공통 조건] 필수 장소 필드 및 위경도 좌표(lat/lng) 명시적 확보
+        restaurants.append({
+            "place_name": doc.get("place_name", ""),
+            "category_name": doc.get("category_name", ""),
+            "phone": doc.get("phone", ""),
+            "address": doc.get("address_name", ""),
+            "road_address": doc.get("road_address_name", ""),
+            "lat": doc.get("y", ""),                    # 위도 (Latitude / y)
+            "lng": doc.get("x", ""),                    # 경도 (Longitude / x)
+            "url": doc.get("place_url", "")             # 상세 장소 URL
+        })
+
+    return restaurants
+
+
+def search_restaurants_for_cities(curation_data: dict, kakao_api_key: str, errors: list) -> list[dict]:
+    """
+    [Commit 7] 1차 추천된 다중 도시 목록을 순회하며 카카오 맛집 검색을 수행합니다. (도시별 5곳)
+    """
+    print(f" {Style.BURNT_ORANGE}[2/3] 추천 지역별 카카오 로컬 맛집 검색 중...{Style.RESET}")
+    restaurants_by_city = []
+
+    cities = curation_data.get("recommended_cities", [])
+    for city in cities:
+        city_name = city.get("city_name", "")
+        if not city_name:
+            continue
+
+        try:
+            place_list = fetch_kakao_restaurants_by_city(city_name, kakao_api_key, size=5)
+            restaurants_by_city.append({
+                "city_name": city_name,
+                "restaurant_count": len(place_list),
+                "places": place_list
+            })
+            print(f"   {Style.FOREST_GRN}✔ [{city_name}]{Style.RESET} 카카오 맛집 {len(place_list)}곳 조회 완료")
+        except Exception as e:
+            errors.append({"step": "kakao_search", "type": "SEARCH_ERROR", "message": f"{city_name}: {str(e)}"})
+            err_summary = "카카오 API 키/권한 오류" if "403" in str(e) or "401" in str(e) else str(e)
+            print(f"   {Style.BG_WARN} ⚠️ KAKAO WARN {Style.RESET} {Style.BOLD}{Style.WHITE}[{city_name}]{Style.RESET} {Style.CONCRETE}맛집 검색 실패 ({err_summary}){Style.RESET}")
+
+    return restaurants_by_city
+
+
+# ==============================================================================
 # [Main Pipeline] CLI 실행 엔트리포인트
 # ==============================================================================
 def main():
@@ -347,9 +419,12 @@ def main():
     # [Commit 6] 파싱 및 스키마 검증이 완료된 1차 추천 딕셔너리 획득
     curation_result = get_curated_recommendations_with_retry(travel_date, gemini_key, errors)
 
-    print(f"\n{Style.SUCCESS_GRN}✔ [1차 여행지 큐레이션 완료]{Style.RESET}")
+    # [Commit 7] 카카오 다중 도시 맛집 검색 파이프라인 연동 (도시별 5곳, lat/lng 좌표 포함)
+    restaurant_results = search_restaurants_for_cities(curation_result, kakao_key, errors)
+
+    print(f"\n{Style.SUCCESS_GRN}✔ [카카오 맛집 검색 결과]{Style.RESET}")
     print(f"{Style.DARK_GRAY}──────────────────────────────────────────────────────────────────{Style.RESET}")
-    print(json.dumps(curation_result, ensure_ascii=False, indent=2))
+    print(json.dumps(restaurant_results, ensure_ascii=False, indent=2))
     print(f"{Style.DARK_GRAY}──────────────────────────────────────────────────────────────────{Style.RESET}\n")
 
 

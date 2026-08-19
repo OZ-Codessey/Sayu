@@ -8,12 +8,13 @@ import sys                      # [Commit 3] 유효성 검증 실패 시 예외 
 from datetime import datetime   # [Commit 3] 날짜 유효성 검증 및 계절 테마 판별
 from dotenv import load_dotenv  # [Commit 4] .env 파일 환경변수 로드
 
-# [Commit 5] Google GenAI SDK
+# [Commit 5/9] Google GenAI SDK (1차 추천 및 최종 종합 리포트 생성)
 from google import genai
 from google.genai import types
 from google.genai.errors import APIError  # [Commit 6] LLM 통신/서버 에러 방어용
 
 # [Commit 7] 카카오 로컬 REST API 통신용 라이브러리 (pip install requests)
+# [Commit 8] 카카오 API 세부 HTTPError / Timeout / ConnectionError 예외 격리용
 import requests
 
 
@@ -170,11 +171,11 @@ def check_api_keys() -> tuple[str, str]:
 
 
 # ==============================================================================
-# [Commit 5 / Commit 6] Gemini 1차 복수 추천 호출 및 재시도 프롬프트
+# [Commit 5 / Commit 6] Gemini 1차 복수 추천 호출 (System Prompt & User Prompt 분리)
 # ==============================================================================
-def build_curation_prompt(date_str: str, is_retry: bool = False) -> str:
+def build_curation_user_prompt(date_str: str, is_retry: bool = False) -> str:
     """
-    [Commit 5/6] 1차 여행지 추천용 프롬프트 (스켈레톤 구조 템플릿 적용, 2~3곳 가변 큐레이션)
+    [Commit 5/6] 1차 여행지 추천용 User Prompt 구성 (스켈레톤 구조 템플릿 적용)
     """
     season_key = get_season_key(date_str)
     theme_text, _ = get_seasonal_theme(date_str)
@@ -201,7 +202,7 @@ def build_curation_prompt(date_str: str, is_retry: bool = False) -> str:
             "'master_designer', 'weather', 'events', 'reason' 키를 모두 포함한 순수 JSON만 반환하세요.\n"
         )
 
-    prompt = f"""
+    user_prompt = f"""
 {retry_instruction}
 [여행 정보]
 - 여행 일자: {date_str} ({season_key}철)
@@ -215,7 +216,7 @@ def build_curation_prompt(date_str: str, is_retry: bool = False) -> str:
 [반환할 JSON 구조 스키마]
 {json.dumps(dynamic_schema_template, ensure_ascii=False, indent=2)}
 """
-    return prompt
+    return user_prompt
 
 
 def call_gemini_multi_city_recommendation(date_str: str, api_key: str, is_retry: bool = False) -> str:
@@ -224,7 +225,11 @@ def call_gemini_multi_city_recommendation(date_str: str, api_key: str, is_retry:
     """
     client = genai.Client(api_key=api_key)
 
-    system_instruction = (
+    # ┌────────────────────────────────────────────────────────────────────────┐
+    # │ ⚙️ [System Prompt (System Instruction)]                                │
+    # │ 사유 건축 큐레이터 페르소나 및 추천 배제/필수 원칙 규정                │
+    # └────────────────────────────────────────────────────────────────────────┘
+    system_prompt = (
         "당신은 인파로 붐비는 대중 상업 유흥 관광지를 철저히 배제하고, "
         "'보존된 자연 원형'과 '국내외 거장의 건축·조경·예술'이 융합된 침묵과 사색의 공간만을 큐레이션하는 '사유(思惟) 건축 전문 큐레이터'입니다.\n\n"
         "[추천 배제 기준]\n"
@@ -240,14 +245,18 @@ def call_gemini_multi_city_recommendation(date_str: str, api_key: str, is_retry:
         temperature=0.85,
         top_p=0.95,
         response_mime_type="application/json",
-        system_instruction=system_instruction,
+        system_instruction=system_prompt,
         automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True)
     )
 
-    prompt = build_curation_prompt(date_str, is_retry=is_retry)
+    # ┌────────────────────────────────────────────────────────────────────────┐
+    # │ 💬 [User Prompt]                                                       │
+    # └────────────────────────────────────────────────────────────────────────┘
+    user_prompt = build_curation_user_prompt(date_str, is_retry=is_retry)
+    
     response = client.models.generate_content(
         model="gemini-3.5-flash",
-        contents=prompt,
+        contents=user_prompt,
         config=config
     )
     return response.text
@@ -336,6 +345,7 @@ def get_curated_recommendations_with_retry(date_str: str, api_key: str, errors: 
 
 # ==============================================================================
 # [Commit 7] 카카오 로컬 REST API 기반 다중 도시 맛집 검색 파이프라인
+# 및 [Commit 8 / 오류 방어 3] 401·403 권한·타임아웃·0건(데이터 없음) 비차단(Non-blocking) 예외 격리
 # ==============================================================================
 def fetch_kakao_restaurants_by_city(city_name: str, kakao_api_key: str, size: int = 5) -> list[dict]:
     """
@@ -355,13 +365,22 @@ def fetch_kakao_restaurants_by_city(city_name: str, kakao_api_key: str, size: in
         "sort": "accuracy"             # 정확도순 정렬
     }
 
+    # [Commit 8 / 오류 방어 3-3] 5초 타임아웃을 지정하여 네트워크 지연 크래시 방어
     response = requests.get(url, headers=headers, params=params, timeout=5)
     response.raise_for_status()
     data = response.json()
 
+    # ┌────────────────────────────────────────────────────────────────────────┐
+    # │ [Commit 8 / 오류 방어 3-1] 검색 결과 0건 ("데이터 없음") 방어 처리         │
+    # │ 카카오 응답에 'documents'가 비어있는 경우 빈 리스트([])를 즉시 반환       │
+    # └────────────────────────────────────────────────────────────────────────┘
+    documents = data.get("documents", [])
+    if not documents:
+        return []
+
     restaurants = []
-    for doc in data.get("documents", []):
-        # 🌟 [과제 공통 조건] 필수 장소 필드 및 위경도 좌표(lat/lng) 명시적 확보
+    for doc in documents:
+        # [Commit 7] 필수 장소 필드 및 위경도 좌표(lat/lng) 명시적 추출
         restaurants.append({
             "place_name": doc.get("place_name", ""),
             "category_name": doc.get("category_name", ""),
@@ -379,6 +398,7 @@ def fetch_kakao_restaurants_by_city(city_name: str, kakao_api_key: str, size: in
 def search_restaurants_for_cities(curation_data: dict, kakao_api_key: str, errors: list) -> list[dict]:
     """
     [Commit 7] 1차 추천된 다중 도시 목록을 순회하며 카카오 맛집 검색을 수행합니다. (도시별 5곳)
+    [Commit 8 / 오류 방어 3] 에러 발생 시 프로그램을 중단하지 않고 비차단(Non-blocking)으로 격리합니다.
     """
     print(f" {Style.BURNT_ORANGE}[2/3] 추천 지역별 카카오 로컬 맛집 검색 중...{Style.RESET}")
     restaurants_by_city = []
@@ -391,18 +411,183 @@ def search_restaurants_for_cities(curation_data: dict, kakao_api_key: str, error
 
         try:
             place_list = fetch_kakao_restaurants_by_city(city_name, kakao_api_key, size=5)
-            restaurants_by_city.append({
-                "city_name": city_name,
-                "restaurant_count": len(place_list),
-                "places": place_list
-            })
-            print(f"   {Style.FOREST_GRN}✔ [{city_name}]{Style.RESET} 카카오 맛집 {len(place_list)}곳 조회 완료")
+
+            # ┌────────────────────────────────────────────────────────────────┐
+            # │ [Commit 8 / 오류 방어 3-1] 검색 결과 0건 ("데이터 없음") 상태 격리 │
+            # └────────────────────────────────────────────────────────────────┘
+            if len(place_list) == 0:
+                restaurants_by_city.append({
+                    "city_name": city_name,
+                    "restaurant_count": 0,
+                    "places": [],
+                    "status": "NO_DATA"
+                })
+                print(f"   {Style.CONCRETE}ℹ [{city_name}] 등록된 맛집 데이터 없음 (0건){Style.RESET}")
+            else:
+                # [Commit 7] 정상 조회 성공 적재
+                restaurants_by_city.append({
+                    "city_name": city_name,
+                    "restaurant_count": len(place_list),
+                    "places": place_list,
+                    "status": "SUCCESS"
+                })
+                print(f"   {Style.FOREST_GRN}✔ [{city_name}]{Style.RESET} 카카오 맛집 {len(place_list)}곳 조회 완료")
+
+        # ┌────────────────────────────────────────────────────────────────────┐
+        # │ [Commit 8 / 오류 방어 3-2] HTTP 401/403 인증 권한 에러 비차단 격리   │
+        # └────────────────────────────────────────────────────────────────────┘
+        except requests.exceptions.HTTPError as http_err:
+            status_code = http_err.response.status_code if http_err.response is not None else "UNKNOWN"
+            errors.append({"step": "kakao_search", "type": f"HTTP_{status_code}_ERROR", "message": f"{city_name}: {str(http_err)}"})
+            print(f"   {Style.BG_WARN} ⚠️ AUTH WARN {Style.RESET} {Style.BOLD}{Style.WHITE}[{city_name}]{Style.RESET} {Style.CONCRETE}카카오 인증/권한 오류 ({status_code}) - 건너뜁니다.{Style.RESET}")
+            restaurants_by_city.append({"city_name": city_name, "restaurant_count": 0, "places": [], "status": f"HTTP_{status_code}_ERROR"})
+
+        # ┌────────────────────────────────────────────────────────────────────┐
+        # │ [Commit 8 / 오류 방어 3-3] 네트워크 타임아웃/접속 지연 비차단 격리 │
+        # └────────────────────────────────────────────────────────────────────┘
+        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as conn_err:
+            errors.append({"step": "kakao_search", "type": "NETWORK_TIMEOUT_OR_CONN_ERROR", "message": f"{city_name}: {str(conn_err)}"})
+            print(f"   {Style.BG_WARN} ⚠️ NET WARN {Style.RESET} {Style.BOLD}{Style.WHITE}[{city_name}]{Style.RESET} {Style.CONCRETE}통신 장애/타임아웃 발생 - 건너뜁니다.{Style.RESET}")
+            restaurants_by_city.append({"city_name": city_name, "restaurant_count": 0, "places": [], "status": "NETWORK_ERROR"})
+
+        # ┌────────────────────────────────────────────────────────────────────┐
+        # │ [Commit 7 원형 보존 / 오류 방어 3-4] 기타 모든 예외 격리 최종 안전망 │
+        # └────────────────────────────────────────────────────────────────────┘
         except Exception as e:
-            errors.append({"step": "kakao_search", "type": "SEARCH_ERROR", "message": f"{city_name}: {str(e)}"})
+            errors.append({"step": "kakao_search", "type": "SEARCH_EXCEPTION", "message": f"{city_name}: {str(e)}"})
             err_summary = "카카오 API 키/권한 오류" if "403" in str(e) or "401" in str(e) else str(e)
-            print(f"   {Style.BG_WARN} ⚠️ KAKAO WARN {Style.RESET} {Style.BOLD}{Style.WHITE}[{city_name}]{Style.RESET} {Style.CONCRETE}맛집 검색 실패 ({err_summary}){Style.RESET}")
+            print(f"   {Style.BG_WARN} ⚠️ KAKAO WARN {Style.RESET} {Style.BOLD}{Style.WHITE}[{city_name}]{Style.RESET} {Style.CONCRETE}맛집 검색 예외 발생 - 건너뜁니다 ({err_summary}){Style.RESET}")
+            restaurants_by_city.append({"city_name": city_name, "restaurant_count": 0, "places": [], "status": "ERROR"})
 
     return restaurants_by_city
+
+
+# ==============================================================================
+# ┌────────────────────────────────────────────────────────────────────────────┐
+# │ [Commit 9] Gemini 2차 종합 마크다운 리포트 생성 및 에러 요약 파이프라인       │
+# │ - System Prompt: 수석 도슨트 페르소나 및 마크다운 리포팅 규칙             │
+# │ - User Prompt: 1차 추천 + 카카오 맛집 + 에러 로그 결합 프롬프트            │
+# │                                                                            │
+# │ 🌟 [핵심 평가 포인트: Gemini 2차 추론 기반 맛집 최종 엄선]                 │
+# │   카카오가 검색해 온 도시별 5곳의 맛집 후보 중, 사유 여행 테마에 최적인     │
+# │   '가장 정갈한 식당 1곳'을 Gemini가 2차로 직접 엄선하여 1일 점심 코스에 연결 │
+# └────────────────────────────────────────────────────────────────────────────┘
+# ==============================================================================
+def build_final_report_user_prompt(date_str: str, curation_data: dict, restaurant_data: list, errors: list) -> str:
+    """
+    [Commit 9] 1차 건축 큐레이션 결과와 2차 카카오 실시간 맛집 데이터, 시스템 에러 로그를
+    결합하여 최종 마크다운 리포트 생성을 위한 User Prompt를 구성합니다.
+    """
+    season_key = get_season_key(date_str)
+    theme_text, _ = get_seasonal_theme(date_str)
+
+    user_prompt = f"""
+[여행 기본 정보]
+- 여행 일자: {date_str} ({season_key}철)
+- 계절 테마: {theme_text}
+
+# ┌────────────────────────────────────────────────────────────────────────┐
+# │ 📍 [데이터 전달 지점 3: User Prompt에 JSON 컨텍스트 주입]               │
+# │ 1. 1차 추천 사유 명소 데이터 (JSON)                                    │
+# │ 2. 카카오 로컬 실시간 맛집 데이터 (도시별 5곳 후보군) (JSON)             │
+# │ 3. 시스템 실행 중 수집된 에러 로그 (JSON)                              │
+# └────────────────────────────────────────────────────────────────────────┘
+[1차 추천 명소 데이터 (JSON)]
+{json.dumps(curation_data, ensure_ascii=False, indent=2)}
+
+[카카오 로컬 실시간 맛집 데이터 (JSON)]
+{json.dumps(restaurant_data, ensure_ascii=False, indent=2)}
+
+[시스템 에러 로그 (JSON)]
+{json.dumps(errors, ensure_ascii=False, indent=2)}
+
+[마크다운 리포트 작성 가이드라인]
+1. **리포트 제목**: 사유의 미학을 담은 서정적이고 품격 있는 메인 제목 (#)
+2. **계절 테마 및 서문**: 해당 계절에 떠나는 사유와 건축 여행의 철학적 의미 소개
+3. **추천 도시별 1일 사유 여행 코스 (추천된 각 도시마다 ## 로 개별 구성)**:
+   - **명소 및 거장 소개**: 대표 사유 명소(main_attraction), 참여 건축가/조경가(master_designer), 공간 철학과 계절 날씨/정취
+   
+   # ┌────────────────────────────────────────────────────────────────────────┐
+   # │ 🌟 [평가 포인트] Gemini 2차 추론: 카카오 맛집 5곳 중 최적 1곳 최종 엄선  │
+   # └────────────────────────────────────────────────────────────────────────┘
+   - **🌿 도슨트 큐레이션 미식 가이드 (In-House Dining & Gemini Pick 1)**:
+     * **[원내(院內) 품격 다이닝 강조]**: 만약 해당 명소가 '사유원'인 경우, 사유원 내부(원내)에 위치하여 자연과 노출 콘크리트 건축을 조망하며 식사할 수 있는 품격 있는 식음 공간(예: 사담, 몽몽마방 등 원내 다이닝/카페)에서 사유의 흐름을 끊지 않고 미식을 즐길 수 있다는 독보적인 장점을 매력적으로 어필하세요.
+     * **[카카오 로컬 5곳 중 Gemini 최종 엄선 1곳]**: 제공된 [카카오 로컬 실시간 맛집 데이터] 5곳 중 사유 여행의 정취와 가장 어울리는 **'가장 정갈한 식당 단 1곳'을 LLM인 당신이 직접 2차 최종 엄선**하세요. 엄선된 식당의 상호명, 주소, 상세 링크 URL([상호명](url))을 명시하고 선정 이유를 2문장 내외로 서술하세요. (원내 식사 대안 또는 원외 방문용)
+   
+   # ┌────────────────────────────────────────────────────────────────────────┐
+   # │ 🌟 [평가 포인트] 엄선된 맛집을 1일 일정(점심)에 직접 매핑              │
+   # └────────────────────────────────────────────────────────────────────────┘
+   - **사색과 관조의 1일 동선 (Morning / Lunch / Afternoon / Evening)**:
+     * **오전 (Morning)**: 자연 원형 속 거장의 건축물을 고요히 마주하는 사색의 시간
+     * **점심 (Lunch)**: (사유원의 경우) 원내 다이닝 또는 위에서 **Gemini가 2차 엄선한 [식당명](URL)**에서의 정갈한 오찬
+     * **오후 (Afternoon)**: 정원 및 주요 조경/전시 포인트 심층 탐방 (events 포인트 적극 반영)
+     * **저녁 (Evening)**: 노을과 함께 하루의 여운을 정리하는 고즈넉한 마무리
+   - **카카오 로컬 맛집 후보군 전체 목록 (5곳)**: 카카오가 검색해 온 5곳의 식당 후보 전체 정보를 불릿 기호로 깔끔하게 정리 (상호명, 주소, [상세보기 링크](url))
+4. **여행자를 위한 사유 가이드 & 팁**: 이동 시 마음가짐, 복장, 관람 및 식음 시설 사전 예약 팁
+5. **시스템 실행 상태 및 에러 요약 (Error Summary) (최하단 ##)**:
+   - [시스템 에러 로그]를 분석하여 에러가 없으면 "모든 파이프라인이 결함 없이 정상 수행되었습니다." 기록
+   - 에러가 존재할 경우 발생 단계(step), 유형(type), 사유(message)를 불릿 기호로 정리하여 투명하게 기록
+
+오직 가독성이 뛰어난 순수 마크다운(Markdown) 텍스트로만 출력하세요.
+"""
+    return user_prompt
+
+
+# ┌────────────────────────────────────────────────────────────────────────┐
+# │ 📍 [데이터 전달 지점 2: LLM 리포트 생성 함수 매개변수]                 │
+# └────────────────────────────────────────────────────────────────────────┘
+def generate_final_curation_report(
+    date_str: str, 
+    curation_data: dict,      # 👈 1차 건축 명소 추천 데이터
+    restaurant_data: list,    # 👈 카카오 로컬 맛집 검색 데이터 (도시별 5곳)
+    errors: list,             # 👈 시스템 에러 로그
+    api_key: str
+) -> str:
+    """
+    [Commit 9] Gemini 모델을 호출하여 최종 종합 마크다운 리포트를 생성합니다.
+    """
+    print(f" {Style.BURNT_ORANGE}[3/3] 최종 사유 여행 마크다운 종합 리포트 생성 중...{Style.RESET}")
+    client = genai.Client(api_key=api_key)
+
+    # ┌────────────────────────────────────────────────────────────────────────┐
+    # │ ⚙️ [System Prompt (System Instruction)]                                │
+    # │ 수석 도슨트 페르소나 정의                                              │
+    # └────────────────────────────────────────────────────────────────────────┘
+    system_prompt = (
+        "당신은 '자연 원형과 거장의 건축 미학'을 깊이 있게 안내하는 국내 최고 권위의 '사유(思惟) 여행 수석 도슨트'입니다. "
+        "제공된 명소, 맛집, 시스템 로그를 바탕으로 여행자에게 깊은 울림을 주는 품격 있는 마크다운 리포트를 작성합니다."
+    )
+
+    config = types.GenerateContentConfig(
+        temperature=0.7,
+        top_p=0.9,
+        system_instruction=system_prompt,
+        automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True)
+    )
+
+    # ┌────────────────────────────────────────────────────────────────────────┐
+    # │ 💬 [User Prompt]                                                       │
+    # └────────────────────────────────────────────────────────────────────────┘
+    user_prompt = build_final_report_user_prompt(date_str, curation_data, restaurant_data, errors)
+
+    try:
+        response = client.models.generate_content(
+            model="gemini-3.5-flash",
+            contents=user_prompt,
+            config=config
+        )
+        print(f"   {Style.SUCCESS_GRN}✔ 최종 종합 리포트 생성 완료{Style.RESET}\n")
+        return response.text
+    except Exception as e:
+        errors.append({"step": "final_report_generation", "type": "REPORT_GEN_FAIL", "message": str(e)})
+        print(f"\n{Style.BG_RED} ❌ REPORT ERROR {Style.RESET} {Style.BOLD}{Style.ORANGE}최종 리포트 생성 중 오류 발생: {e}{Style.RESET}")
+        return (
+            f"# [사유 여행 리포트 생성 실패]\n\n"
+            f"리포트 생성 중 통신 오류가 발생하였습니다. ({e})\n\n"
+            f"## 수집된 데이터 요약\n"
+            f"- 여행 일자: {date_str}\n"
+            f"- 추천 도시 수: {len(curation_data.get('recommended_cities', []))}\n"
+        )
 
 
 # ==============================================================================
@@ -419,13 +604,25 @@ def main():
     # [Commit 6] 파싱 및 스키마 검증이 완료된 1차 추천 딕셔너리 획득
     curation_result = get_curated_recommendations_with_retry(travel_date, gemini_key, errors)
 
-    # [Commit 7] 카카오 다중 도시 맛집 검색 파이프라인 연동 (도시별 5곳, lat/lng 좌표 포함)
+    # [Commit 7/8 / 오류 방어 3] 카카오 맛집 검색 및 예외 비차단 격리 파이프라인
     restaurant_results = search_restaurants_for_cities(curation_result, kakao_key, errors)
 
-    print(f"\n{Style.SUCCESS_GRN}✔ [카카오 맛집 검색 결과]{Style.RESET}")
-    print(f"{Style.DARK_GRAY}──────────────────────────────────────────────────────────────────{Style.RESET}")
-    print(json.dumps(restaurant_results, ensure_ascii=False, indent=2))
-    print(f"{Style.DARK_GRAY}──────────────────────────────────────────────────────────────────{Style.RESET}\n")
+    # ┌────────────────────────────────────────────────────────────────────────┐
+    # │ 📍 [데이터 전달 지점 1: 메인 파이프라인 주입]                           │
+    # │ [Commit 9] 1차 추천 + 2차 맛집 + 에러 로그 결합 최종 마크다운 리포트 생성 │
+    # └────────────────────────────────────────────────────────────────────────┘
+    final_report_markdown = generate_final_curation_report(
+        travel_date,
+        curation_result,     # 👈 1차 사유 건축 추천 결과
+        restaurant_results,  # 👈 카카오 실시간 맛집 결과
+        errors,              # 👈 시스템 에러 로그
+        gemini_key
+    )
+
+    # 최종 완성된 마크다운 리포트 콘솔 출력
+    print(f"{Style.DARK_GRAY}══════════════════════════════════════════════════════════════════{Style.RESET}")
+    print(final_report_markdown)
+    print(f"{Style.DARK_GRAY}══════════════════════════════════════════════════════════════════{Style.RESET}\n")
 
 
 if __name__ == "__main__":

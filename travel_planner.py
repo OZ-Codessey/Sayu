@@ -2,8 +2,8 @@
 # [Imports & Dependencies] 필수 라이브러리 및 커밋별 사용 내역
 # ==============================================================================
 import argparse                 # [Commit 3] CLI 인자(--date) 파싱 및 표준 도움말 지원
-import json                     # [Commit 5/6] 템플릿 직렬화 및 LLM 응답 JSON 파싱/스키마 검증
-import os                       # [Commit 4] 시스템 환경변수(API 키) 조회
+import json                     # [Commit 5/6/10] 템플릿 직렬화, 파싱 검증 및 JSON 원본 캐시 파일 저장/로드
+import os                       # [Commit 4/10] 환경변수 조회 및 results/ 디렉터리 자동 생성/캐시 파일 확인
 import sys                      # [Commit 3] 유효성 검증 실패 시 예외 종료 (sys.exit)
 from datetime import datetime   # [Commit 3] 날짜 유효성 검증 및 계절 테마 판별
 from dotenv import load_dotenv  # [Commit 4] .env 파일 환경변수 로드
@@ -42,6 +42,7 @@ class Style:
     BG_BURNT    = "\033[48;5;166m\033[38;5;232m\033[1m"
     BG_WARN     = "\033[48;5;214m\033[38;5;232m\033[1m"
     BG_RED      = "\033[48;5;196m\033[38;5;255m\033[1m"
+    BG_CACHE    = "\033[48;5;34m\033[38;5;232m\033[1m"  # [Commit 10] 캐시 적중 전용 강조 배경
 
 
 # ==============================================================================
@@ -226,7 +227,7 @@ def call_gemini_multi_city_recommendation(date_str: str, api_key: str, is_retry:
     client = genai.Client(api_key=api_key)
 
     # ┌────────────────────────────────────────────────────────────────────────┐
-    # │ ⚙️ [System Prompt (System Instruction)]                                │
+    # │ 📜 [System Prompt (System Instruction)] - 1차 명소 발굴                 │
     # │ 사유 건축 큐레이터 페르소나 및 추천 배제/필수 원칙 규정                │
     # └────────────────────────────────────────────────────────────────────────┘
     system_prompt = (
@@ -241,6 +242,7 @@ def call_gemini_multi_city_recommendation(date_str: str, api_key: str, is_retry:
         "3. JSON 스키마의 'master_designer' 필드를 반드시 명시하고, 오직 순수한 JSON 문자열만 반환하세요."
     )
 
+    # 1차 명소 추천을 위한 높은 창의성/다양성 설정 (온도 0.85, top_p 0.95)
     config = types.GenerateContentConfig(
         temperature=0.85,
         top_p=0.95,
@@ -249,9 +251,6 @@ def call_gemini_multi_city_recommendation(date_str: str, api_key: str, is_retry:
         automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True)
     )
 
-    # ┌────────────────────────────────────────────────────────────────────────┐
-    # │ 💬 [User Prompt]                                                       │
-    # └────────────────────────────────────────────────────────────────────────┘
     user_prompt = build_curation_user_prompt(date_str, is_retry=is_retry)
     
     response = client.models.generate_content(
@@ -293,7 +292,7 @@ def get_curated_recommendations_with_retry(date_str: str, api_key: str, errors: 
     """
     [Commit 6 / 오류 방어 2] LLM 응답을 파싱/검증하고 실패 시 최대 1회 재시도합니다. (네트워크/서버 에러 방어 포함)
     """
-    print(f" {Style.BURNT_ORANGE}[1/3] 1차 여행지 추천 생성 중...{Style.RESET}")
+    print(f" {Style.BURNT_ORANGE}[1/3] 1차 여행지 추천 생성 중 ...{Style.RESET}")
 
     # 1차 시도 (API 통신 및 파싱)
     try:
@@ -400,7 +399,7 @@ def search_restaurants_for_cities(curation_data: dict, kakao_api_key: str, error
     [Commit 7] 1차 추천된 다중 도시 목록을 순회하며 카카오 맛집 검색을 수행합니다. (도시별 5곳)
     [Commit 8 / 오류 방어 3] 에러 발생 시 프로그램을 중단하지 않고 비차단(Non-blocking)으로 격리합니다.
     """
-    print(f" {Style.BURNT_ORANGE}[2/3] 추천 지역별 카카오 로컬 맛집 검색 중...{Style.RESET}")
+    print(f" {Style.BURNT_ORANGE}[2/3] 추천 지역별 kakao API 로컬 맛집 검색 중...{Style.RESET}")
     restaurants_by_city = []
 
     cities = curation_data.get("recommended_cities", [])
@@ -451,7 +450,7 @@ def search_restaurants_for_cities(curation_data: dict, kakao_api_key: str, error
             restaurants_by_city.append({"city_name": city_name, "restaurant_count": 0, "places": [], "status": "NETWORK_ERROR"})
 
         # ┌────────────────────────────────────────────────────────────────────┐
-        # │ [Commit 7 원형 보존 / 오류 방어 3-4] 기타 모든 예외 격리 최종 안전망 │
+        # │ [Commit 7 에서 연장/ 오류 방어 3-4] 기타 모든 예외 격리 최종 안전망 │
         # └────────────────────────────────────────────────────────────────────┘
         except Exception as e:
             errors.append({"step": "kakao_search", "type": "SEARCH_EXCEPTION", "message": f"{city_name}: {str(e)}"})
@@ -463,15 +462,7 @@ def search_restaurants_for_cities(curation_data: dict, kakao_api_key: str, error
 
 
 # ==============================================================================
-# ┌────────────────────────────────────────────────────────────────────────────┐
-# │ [Commit 9] Gemini 2차 종합 마크다운 리포트 생성 및 에러 요약 파이프라인       │
-# │ - System Prompt: 수석 도슨트 페르소나 및 마크다운 리포팅 규칙             │
-# │ - User Prompt: 1차 추천 + 카카오 맛집 + 에러 로그 결합 프롬프트            │
-# │                                                                            │
-# │ 🌟 [핵심 평가 포인트: Gemini 2차 추론 기반 맛집 최종 엄선]                 │
-# │   카카오가 검색해 온 도시별 5곳의 맛집 후보 중, 사유 여행 테마에 최적인     │
-# │   '가장 정갈한 식당 1곳'을 Gemini가 2차로 직접 엄선하여 1일 점심 코스에 연결 │
-# └────────────────────────────────────────────────────────────────────────────┘
+# [Commit 9] Gemini 2차 종합 마크다운 리포트 생성 및 에러 요약 파이프라인
 # ==============================================================================
 def build_final_report_user_prompt(date_str: str, curation_data: dict, restaurant_data: list, errors: list) -> str:
     """
@@ -487,10 +478,7 @@ def build_final_report_user_prompt(date_str: str, curation_data: dict, restauran
 - 계절 테마: {theme_text}
 
 # ┌────────────────────────────────────────────────────────────────────────┐
-# │ 📍 [데이터 전달 지점 3: User Prompt에 JSON 컨텍스트 주입]               │
-# │ 1. 1차 추천 사유 명소 데이터 (JSON)                                    │
-# │ 2. 카카오 로컬 실시간 맛집 데이터 (도시별 5곳 후보군) (JSON)             │
-# │ 3. 시스템 실행 중 수집된 에러 로그 (JSON)                              │
+# │ [LLM 주입 데이터: 1차 추천 + 맛집 + 에러 로그 결합 컨텍스트]           │
 # └────────────────────────────────────────────────────────────────────────┘
 [1차 추천 명소 데이터 (JSON)]
 {json.dumps(curation_data, ensure_ascii=False, indent=2)}
@@ -508,14 +496,14 @@ def build_final_report_user_prompt(date_str: str, curation_data: dict, restauran
    - **명소 및 거장 소개**: 대표 사유 명소(main_attraction), 참여 건축가/조경가(master_designer), 공간 철학과 계절 날씨/정취
    
    # ┌────────────────────────────────────────────────────────────────────────┐
-   # │ 🌟 [평가 포인트] Gemini 2차 추론: 카카오 맛집 5곳 중 최적 1곳 최종 엄선  │
+   # │ ✍️[추천 고도화] Gemini 2차 추론: 카카오 맛집 5곳 중 최적 1곳 최종 엄선  │
    # └────────────────────────────────────────────────────────────────────────┘
    - **🌿 도슨트 큐레이션 미식 가이드 (In-House Dining & Gemini Pick 1)**:
      * **[원내(院內) 품격 다이닝 강조]**: 만약 해당 명소가 '사유원'인 경우, 사유원 내부(원내)에 위치하여 자연과 노출 콘크리트 건축을 조망하며 식사할 수 있는 품격 있는 식음 공간(예: 사담, 몽몽마방 등 원내 다이닝/카페)에서 사유의 흐름을 끊지 않고 미식을 즐길 수 있다는 독보적인 장점을 매력적으로 어필하세요.
      * **[카카오 로컬 5곳 중 Gemini 최종 엄선 1곳]**: 제공된 [카카오 로컬 실시간 맛집 데이터] 5곳 중 사유 여행의 정취와 가장 어울리는 **'가장 정갈한 식당 단 1곳'을 LLM인 당신이 직접 2차 최종 엄선**하세요. 엄선된 식당의 상호명, 주소, 상세 링크 URL([상호명](url))을 명시하고 선정 이유를 2문장 내외로 서술하세요. (원내 식사 대안 또는 원외 방문용)
    
    # ┌────────────────────────────────────────────────────────────────────────┐
-   # │ 🌟 [평가 포인트] 엄선된 맛집을 1일 일정(점심)에 직접 매핑              │
+   # │ ✍️[추천 고도화] 엄선된 맛집을 1일 일정(점심)에 직접 매핑              │
    # └────────────────────────────────────────────────────────────────────────┘
    - **사색과 관조의 1일 동선 (Morning / Lunch / Afternoon / Evening)**:
      * **오전 (Morning)**: 자연 원형 속 거장의 건축물을 고요히 마주하는 사색의 시간
@@ -533,31 +521,28 @@ def build_final_report_user_prompt(date_str: str, curation_data: dict, restauran
     return user_prompt
 
 
-# ┌────────────────────────────────────────────────────────────────────────┐
-# │ 📍 [데이터 전달 지점 2: LLM 리포트 생성 함수 매개변수]                 │
-# └────────────────────────────────────────────────────────────────────────┘
 def generate_final_curation_report(
     date_str: str, 
-    curation_data: dict,      # 👈 1차 건축 명소 추천 데이터
-    restaurant_data: list,    # 👈 카카오 로컬 맛집 검색 데이터 (도시별 5곳)
-    errors: list,             # 👈 시스템 에러 로그
+    curation_data: dict,
+    restaurant_data: list,
+    errors: list,
     api_key: str
 ) -> str:
     """
     [Commit 9] Gemini 모델을 호출하여 최종 종합 마크다운 리포트를 생성합니다.
     """
-    print(f" {Style.BURNT_ORANGE}[3/3] 최종 사유 여행 마크다운 종합 리포트 생성 중...{Style.RESET}")
+    print(f" {Style.BURNT_ORANGE}[3/3] 여행 최종 마크다운 종합 리포트 생성 중 (LLM 2차 추론)...{Style.RESET}")
     client = genai.Client(api_key=api_key)
 
     # ┌────────────────────────────────────────────────────────────────────────┐
-    # │ ⚙️ [System Prompt (System Instruction)]                                │
-    # │ 수석 도슨트 페르소나 정의                                              │
+    # │ 📜 [System Prompt] - 마크다운 작성을 위한 수석 도슨트 서술 페르소나  │
     # └────────────────────────────────────────────────────────────────────────┘
     system_prompt = (
         "당신은 '자연 원형과 거장의 건축 미학'을 깊이 있게 안내하는 국내 최고 권위의 '사유(思惟) 여행 수석 도슨트'입니다. "
         "제공된 명소, 맛집, 시스템 로그를 바탕으로 여행자에게 깊은 울림을 주는 품격 있는 마크다운 리포트를 작성합니다."
     )
 
+    # 최종 리포트의 정갈하고 안정적인 서술을 위한 최적 온도 설정 (온도 0.7, top_p 0.9)
     config = types.GenerateContentConfig(
         temperature=0.7,
         top_p=0.9,
@@ -565,9 +550,6 @@ def generate_final_curation_report(
         automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True)
     )
 
-    # ┌────────────────────────────────────────────────────────────────────────┐
-    # │ 💬 [User Prompt]                                                       │
-    # └────────────────────────────────────────────────────────────────────────┘
     user_prompt = build_final_report_user_prompt(date_str, curation_data, restaurant_data, errors)
 
     try:
@@ -591,7 +573,71 @@ def generate_final_curation_report(
 
 
 # ==============================================================================
-# [Main Pipeline] CLI 실행 엔트리포인트
+# ┌────────────────────────────────────────────────────────────────────────────┐
+# │ [Commit 10 / 보너스 2] 듀얼 파일 내보내기 & 0-Token 결과 캐싱 메커니즘        │
+# │ - 원본 데이터 JSON (1차 큐레이션 + 카카오 맛집 + errors) 저장               │
+# │ - 최종 마크다운 리포트 (.md) 영구 저장                                      │
+# │ - 동일 날짜 재실행 시 외부 API 통신 전면 차단 (Zero-Token Cache Hit)        │
+# └────────────────────────────────────────────────────────────────────────────┘
+# ==============================================================================
+RESULTS_DIR = "results"
+
+
+def get_cache_file_paths(date_str: str) -> tuple[str, str]:
+    """
+    [Commit 10] 여행 날짜 기준 JSON 원본 캐시 파일 및 MD 리포트 파일 경로를 생성합니다.
+    """
+    json_path = os.path.join(RESULTS_DIR, f"travel_plan_{date_str}.json")
+    md_path = os.path.join(RESULTS_DIR, f"travel_report_{date_str}.md")
+    return json_path, md_path
+
+
+def load_cached_results(date_str: str) -> tuple[dict | None, str | None]:
+    """
+    [Commit 10 / 보너스 2: 0-Token 캐싱 메커니즘]
+    동일한 날짜(--date)로 실행 시, 이미 저장된 파일이 존재하면 디스크에서 즉시 로드합니다.
+    외부 API(Gemini LLM 및 Kakao API) 호출을 100% 생략하여 비용과 토큰 소모를 제로(0)로 만듭니다.
+    """
+    json_path, md_path = get_cache_file_paths(date_str)
+
+    if os.path.exists(json_path) and os.path.exists(md_path):
+        try:
+            with open(json_path, "r", encoding="utf-8") as jf:
+                cached_json = json.load(jf)
+            with open(md_path, "r", encoding="utf-8") as mf:
+                cached_md = mf.read()
+            return cached_json, cached_md
+        except Exception:
+            return None, None
+
+    return None, None
+
+
+def save_dual_results(date_str: str, raw_payload: dict, report_markdown: str):
+    """
+    [Commit 10 / 보너스 2: 듀얼 파일 내보내기]
+    results/ 디렉터리를 자동 생성하고 원본 JSON 및 최종 Markdown 리포트를 파일로 영구 저장합니다.
+    """
+    os.makedirs(RESULTS_DIR, exist_ok=True)
+    json_path, md_path = get_cache_file_paths(date_str)
+
+    # 1. 원본 데이터 종합 JSON 저장 (1차 추천 + 맛집 검색 결과 + 에러 요약)
+    with open(json_path, "w", encoding="utf-8") as jf:
+        json.dump(raw_payload, jf, ensure_ascii=False, indent=2)
+
+    # 2. 최종 리포트 마크다운 (.md) 저장
+    with open(md_path, "w", encoding="utf-8") as mf:
+        mf.write(report_markdown)
+
+    print(f"\n{Style.DARK_GRAY}──────────────────────────────────────────────────────────────────{Style.RESET}")
+    print(f"{Style.SUCCESS_GRN} [Commit 10 / 듀얼 파일 저장 완료]{Style.RESET}")
+    print(f"   {Style.FOREST_GRN}├─ 💾 원본 데이터 JSON :{Style.RESET} {Style.WHITE}{json_path}{Style.RESET}")
+    print(f"   {Style.FOREST_GRN}└─ 📝 최종 리포트 MD   :{Style.RESET} {Style.WHITE}{md_path}{Style.RESET}")
+    print(f"{Style.DARK_GRAY}──────────────────────────────────────────────────────────────────{Style.RESET}\n")
+
+
+# ==============================================================================
+# [Main Pipeline] CLI 실행 엔트리포인트 (0-Token 캐싱 분기 포함)
 # ==============================================================================
 def main():
     errors = []  # 시스템 전역 에러 격리 리스트
@@ -599,25 +645,56 @@ def main():
     args = parse_arguments()
     travel_date = validate_date(args.date)
     print_banner(travel_date)
+
+    # ┌────────────────────────────────────────────────────────────────────────┐
+    # │ ⚡ [Commit 10 / 보너스 2] 0-Token 캐시 적중 검사 (Zero-Token Cache Hit)  │
+    # │ 동일한 날짜의 캐시 파일이 존재하면 외부 API(Gemini/Kakao) 통신을 전면     │
+    # │ 생략하고 디스크에서 리포트를 즉시 출력하여 토큰 소모를 0으로 만듭니다.    │
+    # └────────────────────────────────────────────────────────────────────────┘
+    cached_payload, cached_report = load_cached_results(travel_date)
+
+    if cached_payload is not None and cached_report is not None:
+        print(f"{Style.BG_CACHE} ⚡ ZERO-TOKEN CACHE HIT {Style.RESET} {Style.BOLD}{Style.SPRING_GRN}동일 날짜 캐시가 발견되어 모든 외부 API 호출을 생략합니다.{Style.RESET}")
+        print(f"   {Style.CONCRETE}Token 소모량 :{Style.RESET} {Style.BOLD}{Style.WHITE}0 Tokens (비용 0원 최적화 달성){Style.RESET}")
+        print(f"   {Style.CONCRETE}캐시 로드 경로 :{Style.RESET} {Style.DIM}results/travel_plan_{travel_date}.json / travel_report_{travel_date}.md{Style.RESET}\n")
+
+       # 👈 캐시된 마크다운 리포트 즉시 출력 후 프로그램 종료 (API 호출 0회)       
+        print(f"{Style.DARK_GRAY}══════════════════════════════════════════════════════════════════{Style.RESET}")
+        print(cached_report)
+        print(f"{Style.DARK_GRAY}══════════════════════════════════════════════════════════════════{Style.RESET}\n")
+        return  # 👈 중요: 아래의 API 호출 코드들로 내려가지 않고 즉시 종료!
+
+    # [Cache Miss] 캐시가 없을 때만 API 키 확인 및 전체 파이프라인 수행
     gemini_key, kakao_key = check_api_keys()
 
-    # [Commit 6] 파싱 및 스키마 검증이 완료된 1차 추천 딕셔너리 획득
+    # [Commit 5/6] 1차 추천 딕셔너리 획득
     curation_result = get_curated_recommendations_with_retry(travel_date, gemini_key, errors)
 
     # [Commit 7/8 / 오류 방어 3] 카카오 맛집 검색 및 예외 비차단 격리 파이프라인
     restaurant_results = search_restaurants_for_cities(curation_result, kakao_key, errors)
 
-    # ┌────────────────────────────────────────────────────────────────────────┐
-    # │ 📍 [데이터 전달 지점 1: 메인 파이프라인 주입]                           │
-    # │ [Commit 9] 1차 추천 + 2차 맛집 + 에러 로그 결합 최종 마크다운 리포트 생성 │
-    # └────────────────────────────────────────────────────────────────────────┘
+    # [Commit 9] 1차 추천 + 2차 맛집 + 에러 로그 결합 최종 마크다운 리포트 생성
     final_report_markdown = generate_final_curation_report(
         travel_date,
-        curation_result,     # 👈 1차 사유 건축 추천 결과
-        restaurant_results,  # 👈 카카오 실시간 맛집 결과
-        errors,              # 👈 시스템 에러 로그
+        curation_result,
+        restaurant_results,
+        errors,
         gemini_key
     )
+
+    # ┌────────────────────────────────────────────────────────────────────────┐
+    # │ 💾[Commit 10 / 보너스 2] 원본 데이터 JSON 페이로드 구조화 및 듀얼 파일 저장│
+    # └────────────────────────────────────────────────────────────────────────┘
+    raw_payload = {
+        "travel_date": travel_date,
+        "created_at": datetime.now().isoformat(),
+        "curation_result": curation_result,      # 1차 추천 JSON (파싱 결과)
+        "restaurant_results": restaurant_results, # 맛집 검색 결과 (리스트, 0건 가능)
+        "errors": errors                          # 오류 요약 (errors: array)
+    }
+
+    # 파일 영구 저장 실행 (results/ 폴더 자동 생성)
+    save_dual_results(travel_date, raw_payload, final_report_markdown)
 
     # 최종 완성된 마크다운 리포트 콘솔 출력
     print(f"{Style.DARK_GRAY}══════════════════════════════════════════════════════════════════{Style.RESET}")
